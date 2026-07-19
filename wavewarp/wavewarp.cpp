@@ -18,6 +18,7 @@ static OfxParameterSuiteV1*   gParamSuite;
 #define PARAM_SPEED       "waveWarpSpeed"
 #define PARAM_OFFSET      "waveWarpOffset"
 #define PARAM_ORIENTATION "waveWarpOrientation"
+#define PARAM_ADAPT_ASPECT "waveWarpAdaptAspect" // New boolean property key
 
 constexpr float DEG_TO_RAD = 0.0174532925f;
 
@@ -55,7 +56,7 @@ OfxStatus DescribePlugin(OfxImageEffectHandle descriptor) {
 
     // Setup visual identity and plugin hierarchy
     gPropSuite->propSetString(effectProps, kOfxPropLabel, 0, "BoutiqueFX Wave Warp");
-    gPropSuite->propSetString(effectProps, kOfxImageEffectPropPluginDescription, 0, "Distorts an image in a sine wave.");
+    gPropSuite->propSetString(effectProps, kOfxImageEffectPropPluginDescription, 0, "Distorts the visuals in a sine wave.");
     gPropSuite->propSetString(effectProps, kOfxImageEffectPropPluginGrouping, 0, "Boutique Plugins");
     
     // Define universal rendering behavior capabilities
@@ -110,6 +111,12 @@ OfxStatus DescribePlugin(OfxImageEffectHandle descriptor) {
     gPropSuite->propSetDouble(paramProps, kOfxParamPropMin, 0, 0.00);
     gPropSuite->propSetDouble(paramProps, kOfxParamPropMax, 0, 360.00);
 
+    // Adapt Amplitude to Aspect Ratio Checkbox Definition (Default: Enabled)
+    gParamSuite->paramDefine(descriptor, kOfxParamTypeBoolean, PARAM_ADAPT_ASPECT, &paramProps);
+    gPropSuite->propSetString(paramProps, kOfxPropLabel, 0, "Adapt Amplitude to Aspect Ratio");
+    gPropSuite->propSetString(paramProps, kOfxParamPropHint, 0, "When enabled, balances wave intensity uniformly across vertical and widescreen targets.");
+    gPropSuite->propSetInt(paramProps, kOfxParamPropDefault, 0, 1); // 1 = True / On
+
     return kOfxStatOK;
 }
 
@@ -130,18 +137,22 @@ OfxStatus RenderEffect(OfxImageEffectHandle instance, OfxPropertySetHandle inArg
 
     // Extract runtime variables and spatial parameters
     double pPeaks, pAmp, pSpeed, pOffset, pOrient;
-    OfxParamHandle hPeaks, hAmp, hSpeed, hOffset, hOrient;
+    int pAdaptAspect = 1;
+    
+    OfxParamHandle hPeaks, hAmp, hSpeed, hOffset, hOrient, hAdaptAspect;
     gParamSuite->paramGetHandle(instance, PARAM_PEAKS, &hPeaks);
     gParamSuite->paramGetHandle(instance, PARAM_AMPLITUDE, &hAmp);
     gParamSuite->paramGetHandle(instance, PARAM_SPEED, &hSpeed);
     gParamSuite->paramGetHandle(instance, PARAM_OFFSET, &hOffset);
     gParamSuite->paramGetHandle(instance, PARAM_ORIENTATION, &hOrient);
+    gParamSuite->paramGetHandle(instance, PARAM_ADAPT_ASPECT, &hAdaptAspect);
 
     gParamSuite->paramGetValueAtTime(hPeaks, time, &pPeaks);
     gParamSuite->paramGetValueAtTime(hAmp, time, &pAmp);
     gParamSuite->paramGetValueAtTime(hSpeed, time, &pSpeed);
     gParamSuite->paramGetValueAtTime(hOffset, time, &pOffset);
     gParamSuite->paramGetValueAtTime(hOrient, time, &pOrient);
+    gParamSuite->paramGetValueAtTime(hAdaptAspect, time, &pAdaptAspect);
 
     // Fetch memory pointers and resolution boundaries
     float *srcData = nullptr;
@@ -158,6 +169,10 @@ OfxStatus RenderEffect(OfxImageEffectHandle instance, OfxPropertySetHandle inArg
     int width  = renderWindow.x2 - renderWindow.x1;
     int height = renderWindow.y2 - renderWindow.y1;
 
+    // Retrieve global project pixel properties to handle non-square aspect metrics
+    double pixelAspectRatio = 1.0;
+    gPropSuite->propGetDouble(sourceImg, kOfxImagePropPixelAspectRatio, 0, &pixelAspectRatio);
+
     // Precalculate wave properties
     float radOrient = (float)pOrient * DEG_TO_RAD;
     float cosOrient = std::cos(radOrient);
@@ -166,7 +181,20 @@ OfxStatus RenderEffect(OfxImageEffectHandle instance, OfxPropertySetHandle inArg
     // Wave animation offset over time
     float timePhase = ((float)pOffset * DEG_TO_RAD) + ((float)time * ((float)pSpeed * 0.05f));
     float waveScale = ((float)pPeaks * 2.0f * 3.14159265f) / (float)width;
-    float ampPixels = (float)pAmp;
+    
+    // Establish structural sizing scales
+    float ampScaleX = 1.0f;
+    float ampScaleY = 1.0f;
+
+    if (pAdaptAspect != 0 && height > 0 && width > 0) {
+        float physicalAspect = ((float)width / (float)height) * (float)pixelAspectRatio;
+        // Normalize aspect distortions by scaling displacement components individually
+        ampScaleX = 1.0f / (float)pixelAspectRatio;
+        ampScaleY = physicalAspect;
+    }
+
+    float ampPixelsX = (float)pAmp * ampScaleX;
+    float ampPixelsY = (float)pAmp * ampScaleY;
 
     // --- AVX2 SIMD Pixel Execution Loop ---
     for (int y = 0; y < height; ++y) {
@@ -176,7 +204,7 @@ OfxStatus RenderEffect(OfxImageEffectHandle instance, OfxPropertySetHandle inArg
         // Process 8 pixels simultaneously using 256-bit AVX vectors
         for (; x <= width - 8; x += 8) {
             alignas(32) float x_vals;
-            for(int i=0; i<8; ++i) x_vals[i] = (float)(x + i);
+            for(int i = 0; i < 8; ++i) x_vals[i] = (float)(x + i);
 
             __m256 vx = _mm256_load_ps(x_vals);
             __m256 vy = _mm256_set1_ps((float)y);
@@ -199,9 +227,9 @@ OfxStatus RenderEffect(OfxImageEffectHandle instance, OfxPropertySetHandle inArg
 
             for(int i = 0; i < 8; ++i) {
                 float sineVal = std::sin(phases[i]);
-                // Push perpendicularly relative to wave orientation tracking values
-                disp_x[i] = x_vals[i] - (sineVal * ampPixels * sinOrient);
-                disp_y[i] = (float)y + (sineVal * ampPixels * cosOrient);
+                // Apply separate horizontal and vertical aspect-calibrated scales
+                disp_x[i] = x_vals[i] - (sineVal * ampPixelsX * sinOrient);
+                disp_y[i] = (float)y + (sineVal * ampPixelsY * cosOrient);
 
                 // Bound check checking constraints to prevent memory leakage faults
                 disp_x[i] = std::clamp(disp_x[i], 0.0f, (float)(width - 1));
@@ -227,8 +255,8 @@ OfxStatus RenderEffect(OfxImageEffectHandle instance, OfxPropertySetHandle inArg
             float phase = ((float)x * cosOrient + (float)y * sinOrient) * waveScale + timePhase;
             float sineVal = std::sin(phase);
 
-            float sampleX = (float)x - (sineVal * ampPixels * sinOrient);
-            float sampleY = (float)y + (sineVal * ampPixels * cosOrient);
+            float sampleX = (float)x - (sineVal * ampPixelsX * sinOrient);
+            float sampleY = (float)y + (sineVal * ampPixelsY * cosOrient);
 
             int sX = std::clamp((int)(sampleX + 0.5f), 0, width - 1);
             int sY = std::clamp((int)(sampleY + 0.5f), 0, height - 1);
