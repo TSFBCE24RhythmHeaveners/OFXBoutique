@@ -7,10 +7,10 @@
 #include "ofxParam.h"
 
 // --- Plugin Identifiers ---
-#define PLUGIN_ID "com.boutiqueofx.amigarulez"
+#define PLUGIN_ID "com.boutiquefx.amigarulez"
 #define PLUGIN_VERSION_MAJOR 1
 #define PLUGIN_VERSION_MINOR 0
-#define PLUGIN_NAME "BTQ_AmigaRulez"
+#define PLUGIN_NAME "BoutiqueFX AmigaRulez"
 #define PLUGIN_DESC "Amiga Rulez like offset & wrap effect."
 #define PLUGIN_GROUP "Boutique Plugins"
 
